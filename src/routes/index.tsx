@@ -1,63 +1,28 @@
 import { $, component$, useSignal, useStore, useVisibleTask$ } from '@builder.io/qwik';
 import { Progress } from '@qwik-ui/headless';
 import { QueryClient } from '@tanstack/query-core';
-import { useForm, zodForm$ } from '@modular-forms/qwik';
+import { reset, useForm, zodForm$ } from '@modular-forms/qwik';
 import { useSpeakLocale } from 'qwik-speak';
 import { z } from 'zod';
 import type { DocumentHead } from '@builder.io/qwik-city';
+import { HALL_DIRECTORY, OP_LABELS } from '~/lib/ledger/types';
+import type { LedgerFile, OutboxEntry, SpeechStatus } from '~/lib/ledger/types';
+import { isFailureOn, loadLedger, dropPendingMerge, setFailure } from '~/lib/ledger/backend';
+import { discardOp, flushOutbox, getClientId, loadOutbox, rebasePendingMerge, retryOp, submitOp } from '~/lib/ledger/client';
+import { approveTerm, loadTerms } from '~/lib/terms';
+import type { Term } from '~/lib/terms';
 
-type SpeechStatus = 'queued' | 'speaking' | 'done' | 'skipped';
-type InterpreterStatus = 'active' | 'handoff' | 'standby';
-type Room = { id: string; name: string; topic: string; simultaneousChannels: number };
-type Speech = { id: string; roomId: string; speaker: string; delegation: string; language: string; topic: string; plannedSeconds: number; remainingSeconds: number; status: SpeechStatus; updatedAt: string };
-type Channel = { id: string; roomId: string; language: string; interpreter: string; status: InterpreterStatus; health: number };
-type Term = { id: string; phrase: string; translation: string; language: string; approved: boolean };
-type Caption = { id: string; speechId: string; roomId: string; language: string; interpreter: string; text: string; revision: number; at: string };
-type Audit = { id: string; at: string; roomId: string; message: string };
+const LOW_LATENCY_KEY = 'conf-low-latency';
 
-interface ConferenceState {
-  rooms: Room[];
-  activeRoomId: string;
-  speechQueue: Speech[];
-  channels: Channel[];
+interface View {
+  ledger: LedgerFile;
+  outbox: OutboxEntry[];
   terms: Term[];
-  captions: Caption[];
-  audits: Audit[];
+  activeHallId: string;
+  clientId: string;
   lowLatency: boolean;
+  simulateFailure: boolean;
 }
-
-const now = new Date().toISOString();
-const seed: ConferenceState = {
-  rooms: [
-    { id: 'hall-a', name: 'A厅 · 全体会议', topic: '全球气候融资', simultaneousChannels: 6 },
-    { id: 'hall-b', name: 'B厅 · 技术分会', topic: '人工智能基础设施', simultaneousChannels: 4 }
-  ],
-  activeRoomId: 'hall-a',
-  speechQueue: [
-    { id: 'speech-1', roomId: 'hall-a', speaker: 'Amina Diallo', delegation: '塞内加尔', language: '英语', topic: '适应性融资缺口', plannedSeconds: 600, remainingSeconds: 214, status: 'speaking', updatedAt: now },
-    { id: 'speech-2', roomId: 'hall-a', speaker: '李明远', delegation: '中国', language: '中文', topic: '绿色基础设施机制', plannedSeconds: 600, remainingSeconds: 600, status: 'queued', updatedAt: now },
-    { id: 'speech-3', roomId: 'hall-b', speaker: 'Maria Silva', delegation: '巴西', language: '葡萄牙语', topic: '边缘算力与能源', plannedSeconds: 420, remainingSeconds: 420, status: 'queued', updatedAt: now }
-  ],
-  channels: [
-    { id: 'ch-a-zh', roomId: 'hall-a', language: '中文', interpreter: '周雨', status: 'active', health: 96 },
-    { id: 'ch-a-es', roomId: 'hall-a', language: '西班牙语', interpreter: 'Lucía M.', status: 'active', health: 91 },
-    { id: 'ch-a-fr', roomId: 'hall-a', language: '法语', interpreter: 'Noah B.', status: 'standby', health: 88 },
-    { id: 'ch-b-zh', roomId: 'hall-b', language: '中文', interpreter: '何佳', status: 'active', health: 94 }
-  ],
-  terms: [
-    { id: 'term-1', phrase: 'loss and damage', translation: '损失与损害', language: '中文', approved: true },
-    { id: 'term-2', phrase: 'edge inference', translation: '边缘推理', language: '中文', approved: true },
-    { id: 'term-3', phrase: 'just transition', translation: '公正转型', language: '中文', approved: false }
-  ],
-  captions: [
-    { id: 'caption-1', speechId: 'speech-1', roomId: 'hall-a', language: '中文', interpreter: '周雨', text: '我们需要把适应资金与可衡量的社区韧性目标绑定。', revision: 2, at: now }
-  ],
-  audits: [
-    { id: 'audit-1', at: now, roomId: 'hall-a', message: 'Amina Diallo 开始发言，中文频道由周雨接续' },
-    { id: 'audit-2', at: new Date(Date.now() - 90000).toISOString(), roomId: 'hall-a', message: '临时插话申请已插入队列第2位' }
-  ],
-  lowLatency: false
-};
 
 const captionSchema = z.object({ text: z.string().min(1, '字幕不能为空') });
 const queueSchema = z.object({
@@ -69,34 +34,21 @@ const queueSchema = z.object({
 });
 type QueueForm = z.infer<typeof queueSchema>;
 
-function readState(): ConferenceState {
-  if (typeof localStorage === 'undefined') return seed;
-  try { return JSON.parse(localStorage.getItem('conference-interpretation-v1') ?? 'null') as ConferenceState ?? seed; } catch { return seed; }
-}
-
-const advanceSpeech$ = $((state: ConferenceState, id: string, status: SpeechStatus) => {
-  state.speechQueue = state.speechQueue.map((item) => item.id === id ? { ...item, status, updatedAt: new Date().toISOString() } : item);
-  if (status === 'speaking') {
-    state.speechQueue = state.speechQueue.map((item) => item.id !== id && item.roomId === state.activeRoomId && item.status === 'speaking' ? { ...item, status: 'done' } : item);
-  }
-  state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `发言 ${id} 状态更新为 ${status}` });
-});
-
-const addCaption$ = $((state: ConferenceState, speechId: string, text: string) => {
-  const speech = state.speechQueue.find((item) => item.id === speechId);
-  const channel = state.channels.find((item) => item.roomId === speech?.roomId && item.language === '中文');
-  if (!speech || !channel || !text.trim()) return;
-  const existing = state.captions.find((item) => item.speechId === speechId && item.language === channel.language);
-  if (existing) {
-    state.captions = state.captions.map((item) => item.id === existing.id ? { ...item, text, revision: item.revision + 1, interpreter: channel.interpreter, at: new Date().toISOString() } : item);
-  } else {
-    state.captions.unshift({ id: crypto.randomUUID(), speechId, roomId: speech.roomId, language: channel.language, interpreter: channel.interpreter, text, revision: 1, at: new Date().toISOString() });
-  }
-});
+const fmtClock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+const hallName = (hallId: string) => HALL_DIRECTORY.find((h) => h.id === hallId)?.name ?? hallId;
 
 export default component$(() => {
   const locale = useSpeakLocale();
-  const state = useStore<ConferenceState>(readState());
+  const view = useStore<View>({
+    ledger: loadLedger(),
+    outbox: [],
+    terms: loadTerms(),
+    activeHallId: HALL_DIRECTORY[0].id,
+    clientId: '…',
+    lowLatency: false,
+    simulateFailure: false
+  });
+  const interrupt = useSignal(false);
   const captionLoader = useSignal({ text: '' });
   const [captionForm, { Form: CaptionForm, Field: CaptionField }] = useForm<z.infer<typeof captionSchema>>({
     loader: captionLoader,
@@ -108,112 +60,356 @@ export default component$(() => {
     validate: zodForm$(queueSchema)
   });
 
-  useVisibleTask$(({ track }) => {
-    track(() => state);
-    localStorage.setItem('conference-interpretation-v1', JSON.stringify(state));
+  const refresh = $(() => {
+    view.ledger = loadLedger();
+    view.outbox = loadOutbox();
+    view.terms = loadTerms();
+    view.simulateFailure = isFailureOn();
   });
 
-  const activeRoom = () => state.rooms.find((room) => room.id === state.activeRoomId) ?? state.rooms[0];
-  const roomQueue = () => state.speechQueue.filter((item) => item.roomId === state.activeRoomId);
-  const roomChannels = () => state.channels.filter((item) => item.roomId === state.activeRoomId);
-  const currentSpeech = () => roomQueue().find((item) => item.status === 'speaking');
+  useVisibleTask$(() => {
+    view.clientId = getClientId();
+    view.lowLatency = localStorage.getItem(LOW_LATENCY_KEY) === '1';
+    // 重开继续：页面加载后立即重试上次未落账的待办
+    flushOutbox();
+    refresh();
+    const onStorage = () => refresh();
+    window.addEventListener('storage', onStorage);
+    const timer = window.setInterval(() => {
+      flushOutbox();
+      refresh();
+    }, 4000);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.clearInterval(timer);
+    };
+  });
 
-  const selectRoom$ = $((roomId: string) => {
-    state.activeRoomId = roomId;
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId, message: `切换到 ${state.rooms.find((room) => room.id === roomId)?.name}` });
+  const hall = () => view.ledger.halls[view.activeHallId];
+  const hallMeta = () => HALL_DIRECTORY.find((h) => h.id === view.activeHallId) ?? HALL_DIRECTORY[0];
+  const queue = () => hall()?.queue ?? [];
+  const speaking = () => queue().find((s) => s.status === 'speaking');
+  const drafts = () => (hall()?.captions ?? []).filter((c) => !c.confirmed);
+  const confirmedCaptions = () => (hall()?.captions ?? []).filter((c) => c.confirmed).slice(0, 5);
+  const hallMerges = () => view.ledger.pendingMerges.filter((m) => m.hallId === view.activeHallId);
+  const hallEvents = () => view.ledger.events.filter((e) => e.hallId === view.activeHallId).slice(0, 12);
+  const speakerName = (speechId: string) => queue().find((s) => s.id === speechId)?.speaker ?? speechId;
+
+  const selectHall$ = $((hallId: string) => {
+    view.activeHallId = hallId;
   });
 
   const addSpeech$ = $((values: QueueForm) => {
-    state.speechQueue.push({ id: crypto.randomUUID(), roomId: state.activeRoomId, ...values, remainingSeconds: values.plannedSeconds, status: 'queued', updatedAt: new Date().toISOString() });
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `${values.speaker} 已加入发言队列` });
+    submitOp(view.activeHallId, {
+      type: 'queue.add',
+      speech: { speaker: values.speaker, delegation: values.delegation, language: values.language, topic: values.topic, plannedSeconds: values.plannedSeconds },
+      insertAfterCurrent: interrupt.value
+    });
+    interrupt.value = false;
+    reset(queueForm);
+    refresh();
+  });
+
+  const advanceSpeech$ = $((speechId: string, status: SpeechStatus) => {
+    submitOp(view.activeHallId, { type: 'queue.advance', speechId, status });
+    refresh();
+  });
+
+  const reorderSpeech$ = $((speechId: string, direction: -1 | 1) => {
+    submitOp(view.activeHallId, { type: 'queue.reorder', speechId, direction });
+    refresh();
+  });
+
+  const adjustTime$ = $((speechId: string, deltaSeconds: number) => {
+    submitOp(view.activeHallId, { type: 'queue.adjustTime', speechId, deltaSeconds });
+    refresh();
+  });
+
+  const saveDraft$ = $(async (values: z.infer<typeof captionSchema>) => {
+    const speech = view.ledger.halls[view.activeHallId]?.queue.find((s) => s.status === 'speaking');
+    if (!speech) return;
+    const queryClient = new QueryClient();
+    const text = await queryClient.fetchQuery({
+      queryKey: ['caption-draft', speech.id, values.text],
+      queryFn: async () => values.text.trim(),
+      staleTime: 0
+    });
+    if (!text) return;
+    submitOp(view.activeHallId, { type: 'caption.saveDraft', speechId: speech.id, language: '中文', text });
+    reset(captionForm);
+    refresh();
+  });
+
+  const confirmCaption$ = $((captionId: string) => {
+    submitOp(view.activeHallId, { type: 'caption.confirm', captionId });
+    refresh();
   });
 
   const handoff$ = $((channelId: string) => {
-    state.channels = state.channels.map((channel) => channel.id === channelId ? { ...channel, status: 'handoff' } : channel);
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `${channelId} 启动译员交接，原译文版本已冻结` });
+    submitOp(view.activeHallId, { type: 'duty.handoffStart', channelId });
+    refresh();
   });
 
-  const completeHandoff$ = $((channelId: string, interpreter: string) => {
-    state.channels = state.channels.map((channel) => channel.id === channelId ? { ...channel, interpreter, status: 'active', health: Math.min(100, channel.health + 2) } : channel);
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `${interpreter} 接续 ${channelId}，后续字幕归属新译员` });
+  const completeHandoff$ = $((channelId: string, language: string) => {
+    submitOp(view.activeHallId, { type: 'duty.handoffComplete', channelId, interpreter: `替补译员-${language}` });
+    refresh();
   });
 
-  const publishCaption$ = $(async (values: z.infer<typeof captionSchema>) => {
-    const speech = state.speechQueue.find((item) => item.roomId === state.activeRoomId && item.status === 'speaking');
-    if (!speech) return;
-    const queryClient = new QueryClient();
-    const confirmed = await queryClient.fetchQuery({
-      queryKey: ['caption-publish', speech.id, values.text],
-      queryFn: async () => values.text === values.text.trim(),
-      staleTime: 0
-    });
-    if (confirmed) await addCaption$(state, speech.id, values.text);
+  const rebaseMerge$ = $((mergeId: string) => {
+    try {
+      rebasePendingMerge(mergeId);
+    } catch {
+      /* 写账故障时待合并与待办都保留，稍后重试 */
+    }
+    refresh();
+  });
+
+  const dismissMerge$ = $((mergeId: string) => {
+    try {
+      dropPendingMerge(mergeId, `${view.clientId} 放弃了这条待合并，账上先到内容未变`);
+    } catch {
+      /* 写账故障时保留待合并 */
+    }
+    refresh();
+  });
+
+  const retryOne$ = $((hallId: string, opId: string) => {
+    retryOp(hallId, opId);
+    refresh();
+  });
+
+  const retryAll$ = $(() => {
+    flushOutbox();
+    refresh();
+  });
+
+  const discardOne$ = $((hallId: string, opId: string) => {
+    discardOp(hallId, opId);
+    refresh();
+  });
+
+  const toggleFailure$ = $(() => {
+    const next = !view.simulateFailure;
+    setFailure(next);
+    view.simulateFailure = next;
+    if (!next) flushOutbox();
+    refresh();
+  });
+
+  const toggleLatency$ = $(() => {
+    view.lowLatency = !view.lowLatency;
+    localStorage.setItem(LOW_LATENCY_KEY, view.lowLatency ? '1' : '0');
   });
 
   const approveTerm$ = $((id: string) => {
-    state.terms = state.terms.map((term) => term.id === id ? { ...term, approved: true } : term);
-    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `术语已批准：${state.terms.find((term) => term.id === id)?.phrase}` });
+    approveTerm(id);
+    refresh();
   });
 
   return (
-    <main class={`conference-shell ${state.lowLatency ? 'low-latency' : ''}`}>
+    <main class={`conference-shell ${view.lowLatency ? 'low-latency' : ''}`}>
       <header class="hero">
-        <div><span class="pill">{locale.lang}</span><h1>同声传译与发言队列</h1><p>{activeRoom().name} · {activeRoom().topic}</p></div>
-        <div style="display:flex;gap:12px;flex-wrap:wrap">
-          <select value={state.activeRoomId} onChange$={(event) => selectRoom$((event.target as HTMLSelectElement).value)}>{state.rooms.map((room) => <option value={room.id}>{room.name}</option>)}</select>
-          <button class="secondary" onClick$={() => state.lowLatency = !state.lowLatency}>{state.lowLatency ? '退出低延迟' : '低延迟模式'}</button>
+        <div>
+          <span class="pill">{locale.lang}</span>
+          <h1>同声传译与发言队列</h1>
+          <p>{hallMeta().name} · {hallMeta().topic}</p>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <select value={view.activeHallId} onChange$={(event) => selectHall$((event.target as HTMLSelectElement).value)}>
+            {HALL_DIRECTORY.map((h) => <option value={h.id} key={h.id}>{h.name}</option>)}
+          </select>
+          <span class="pill">版本 v{hall()?.version ?? '-'}</span>
+          <span class="pill">上下文纪元 {hall()?.contextEpoch ?? '-'}</span>
+          <span class="pill">本端 {view.clientId}</span>
+          <button class="secondary" onClick$={toggleLatency$}>{view.lowLatency ? '退出低延迟' : '低延迟模式'}</button>
+          <button class={view.simulateFailure ? 'danger' : 'secondary'} onClick$={toggleFailure$}>
+            {view.simulateFailure ? '恢复存储并重试待办' : '模拟存储故障'}
+          </button>
         </div>
       </header>
 
       <section class="grid">
         <article class="panel">
-          <div style="display:flex;justify-content:space-between;align-items:center"><h2>发言队列</h2><span class="pill">{roomQueue().length} 条 · {activeRoom().simultaneousChannels} 个同传频道</span></div>
-          {roomQueue().map((speech, index) => (
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h2>发言队列</h2>
+            <span class="pill">{queue().length} 条 · {hallMeta().simultaneousChannels} 个同传频道</span>
+          </div>
+          {queue().map((speech, index) => (
             <div class={`queue-row ${speech.status === 'speaking' ? 'active' : ''}`} key={speech.id}>
               <strong>#{index + 1}</strong>
-              <div><b>{speech.speaker}</b><div style="color:#638087;font-size:13px">{speech.delegation} · {speech.language} · {speech.topic}</div></div>
-              <span class="pill">{speech.status}</span>
-              <div style="display:flex;gap:6px">
-                {speech.status === 'queued' && <button onClick$={() => advanceSpeech$(state, speech.id, 'speaking')}>开始</button>}
-                {speech.status === 'speaking' && <><button onClick$={() => advanceSpeech$(state, speech.id, 'done')}>结束</button><button class="secondary" onClick$={() => speech.remainingSeconds = Math.max(0, speech.remainingSeconds - 60)}>减1分钟</button></>}
-                {speech.status === 'queued' && <button class="danger" onClick$={() => advanceSpeech$(state, speech.id, 'skipped')}>跳过</button>}
+              <div>
+                <b>{speech.speaker}</b>
+                <div style="color:#638087;font-size:13px">{speech.delegation} · {speech.language} · {speech.topic}</div>
+              </div>
+              <span class="pill">{speech.status} · {fmtClock(speech.remainingSeconds)}</span>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                {speech.status === 'queued' && <button onClick$={() => advanceSpeech$(speech.id, 'speaking')}>开始</button>}
+                {speech.status === 'speaking' && (
+                  <>
+                    <button onClick$={() => advanceSpeech$(speech.id, 'done')}>结束</button>
+                    <button class="secondary" onClick$={() => adjustTime$(speech.id, -60)}>减1分钟</button>
+                  </>
+                )}
+                {speech.status === 'queued' && <button class="danger" onClick$={() => advanceSpeech$(speech.id, 'skipped')}>跳过</button>}
+                {speech.status === 'queued' && (
+                  <>
+                    <button class="secondary" disabled={index === 0} onClick$={() => reorderSpeech$(speech.id, -1)}>↑</button>
+                    <button class="secondary" disabled={index === queue().length - 1} onClick$={() => reorderSpeech$(speech.id, 1)}>↓</button>
+                  </>
+                )}
               </div>
             </div>
           ))}
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:18px">
-            <QueueForm onSubmit$={addSpeech$}>
-              <QueueField name="speaker">{(field, props) => <input {...props} value={field.value} onInput$={(event) => field.value = (event.target as HTMLInputElement).value} placeholder="发言人" />}</QueueField>
-              <QueueField name="delegation">{(field, props) => <input {...props} value={field.value} onInput$={(event) => field.value = (event.target as HTMLInputElement).value} placeholder="代表团" />}</QueueField>
-              <QueueField name="topic">{(field, props) => <input {...props} value={field.value} onInput$={(event) => field.value = (event.target as HTMLInputElement).value} placeholder="议题" />}</QueueField>
-              <QueueField name="plannedSeconds" type="number">{(field, props) => <input {...props} type="number" value={field.value} onInput$={(event) => field.value = Number((event.target as HTMLInputElement).value)} placeholder="计划秒数" />}</QueueField>
-              <button type="submit">加入队列</button>
-            </QueueForm>
-          </div>
+          <QueueForm onSubmit$={addSpeech$}>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:18px">
+              <QueueField name="speaker">{(field, props) => <input {...props} value={field.value} onInput$={(event) => (field.value = (event.target as HTMLInputElement).value)} placeholder="发言人" />}</QueueField>
+              <QueueField name="delegation">{(field, props) => <input {...props} value={field.value} onInput$={(event) => (field.value = (event.target as HTMLInputElement).value)} placeholder="代表团" />}</QueueField>
+              <QueueField name="topic">{(field, props) => <input {...props} value={field.value} onInput$={(event) => (field.value = (event.target as HTMLInputElement).value)} placeholder="议题" />}</QueueField>
+              <QueueField name="language">{(field, props) => (
+                <select {...props} value={field.value} onChange$={(event) => (field.value = (event.target as HTMLSelectElement).value)}>
+                  {['英语', '中文', '法语', '西班牙语', '葡萄牙语', '德语'].map((lang) => <option value={lang} key={lang}>{lang}</option>)}
+                </select>
+              )}</QueueField>
+              <QueueField name="plannedSeconds" type="number">{(field, props) => <input {...props} type="number" value={field.value} onInput$={(event) => (field.value = Number((event.target as HTMLInputElement).value))} placeholder="计划秒数" />}</QueueField>
+              <label style="display:flex;gap:6px;align-items:center;font-size:13px;color:#4c666d">
+                <input type="checkbox" style="width:auto" checked={interrupt.value} onChange$={(event) => (interrupt.value = (event.target as HTMLInputElement).checked)} />
+                临时插话（插到当前发言之后）
+              </label>
+            </div>
+            <div style="margin-top:10px"><button type="submit">加入队列</button></div>
+          </QueueForm>
         </article>
 
         <aside class="panel">
-          <h2>频道与译员</h2>
-          {roomChannels().map((channel) => (
-            <div style="padding:12px 0;border-bottom:1px solid #e6efee" key={channel.id}>
-              <div style="display:flex;justify-content:space-between"><b>{channel.language} · {channel.interpreter}</b><span class="pill">{channel.status}</span></div>
-              <div class="decorative" style="margin:8px 0"><Progress.Root value={channel.health} max={100} /></div>
-              <div style="display:flex;gap:8px"><button class="secondary" onClick$={() => handoff$(channel.id)}>开始交接</button>{channel.status === 'handoff' && <button onClick$={() => completeHandoff$(channel.id, `替补译员-${channel.language}`)}>完成交接</button>}</div>
+          <h2>频道与译员在岗</h2>
+          {(hall()?.duty ?? []).map((duty) => (
+            <div style="padding:12px 0;border-bottom:1px solid #e6efee" key={duty.channelId}>
+              <div style="display:flex;justify-content:space-between">
+                <b>{duty.language} · {duty.interpreter}</b>
+                <span class="pill">{duty.status}</span>
+              </div>
+              <div style="color:#638087;font-size:12px;margin-top:2px">在岗自 {new Date(duty.since).toLocaleTimeString()}</div>
+              <div class="decorative" style="margin:8px 0"><Progress.Root value={duty.health} max={100} /></div>
+              <div style="display:flex;gap:8px">
+                <button class="secondary" disabled={duty.status === 'handoff'} onClick$={() => handoff$(duty.channelId)}>开始交接</button>
+                {duty.status === 'handoff' && <button onClick$={() => completeHandoff$(duty.channelId, duty.language)}>完成交接</button>}
+              </div>
             </div>
           ))}
-          <h3>实时字幕修正</h3>
-          {currentSpeech() ? <CaptionForm onSubmit$={publishCaption$}><CaptionField name="text">{(field, props) => <textarea {...props} rows={3} value={field.value} onInput$={(event) => field.value = (event.target as HTMLTextAreaElement).value} placeholder="输入或修正当前字幕" />}</CaptionField><button type="submit">提交新版字幕</button></CaptionForm> : <p>当前没有发言中的代表。</p>}
-          {state.captions.filter((caption) => caption.roomId === state.activeRoomId).map((caption) => <div style="margin-top:10px;padding:10px;background:#f1f8f7;border-radius:10px" key={caption.id}><b>{caption.interpreter} · v{caption.revision}</b><p>{caption.text}</p></div>)}
+
+          <h3>实时字幕 · 草稿与确认</h3>
+          {speaking() ? (
+            <CaptionForm onSubmit$={saveDraft$}>
+              <CaptionField name="text">{(field, props) => <textarea {...props} rows={3} value={field.value} onInput$={(event) => (field.value = (event.target as HTMLTextAreaElement).value)} placeholder={`为「${speaking()!.speaker}」输入字幕草稿`} />}</CaptionField>
+              <div style="margin-top:8px"><button type="submit">保存草稿</button></div>
+            </CaptionForm>
+          ) : (
+            <p>当前没有发言中的代表。</p>
+          )}
+          {drafts().map((caption) => (
+            <div class={`caption-card ${caption.stale ? 'stale' : ''}`} key={caption.id}>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <b>{caption.interpreter} · {caption.language} · 草稿 v{caption.revision}</b>
+                {caption.stale && <span class="pill warn">已失效 · 已重归属</span>}
+              </div>
+              {caption.stale && caption.reassignedFrom && (
+                <div class="mono" style="margin-top:4px">
+                  原归属：{speakerName(caption.reassignedFrom.speechId)} · {caption.reassignedFrom.interpreter} · 纪元{caption.reassignedFrom.epoch}
+                </div>
+              )}
+              <p style="margin:6px 0">{caption.text}</p>
+              <button onClick$={() => confirmCaption$(caption.id)}>确认发布</button>
+            </div>
+          ))}
+          {confirmedCaptions().map((caption) => (
+            <div class="caption-card" key={caption.id}>
+              <b>{caption.interpreter} · v{caption.revision} · 已确认</b>
+              <p style="margin:6px 0">{caption.text}</p>
+              <div class="mono">{speakerName(caption.speechId)}</div>
+            </div>
+          ))}
         </aside>
       </section>
 
       <section class="grid" style="margin-top:18px">
         <article class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h2>待合并（后到写入）</h2>
+            <span class="pill">{hallMerges().length} 条</span>
+          </div>
+          <p style="color:#638087;font-size:13px;margin-top:4px">依据版本落后于账上版本的写入会列在这里并附差异，先到内容不会被覆盖。</p>
+          {hallMerges().length === 0 && <p>本厅没有待合并的写入。</p>}
+          {hallMerges().map((merge) => (
+            <div class="merge-row" key={merge.id}>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <b>{OP_LABELS[merge.op.payload.type]}</b>
+                <span class="pill warn">依据 v{merge.op.baseVersion} / 当前 v{hall()?.version}</span>
+              </div>
+              <div class="mono" style="margin-top:4px">{merge.op.actor} · {merge.op.opId} · {new Date(merge.at).toLocaleTimeString()}</div>
+              <ul class="diff-list">
+                {merge.diffs.map((diff, i) => (
+                  <li key={i}>
+                    <span>{diff.label}</span>
+                    <span><small>账上当前</small><br />{diff.current}</span>
+                    <span><small>本次提交</small><br />{diff.incoming}</span>
+                  </li>
+                ))}
+              </ul>
+              <div style="display:flex;gap:8px;margin-top:8px">
+                <button onClick$={() => rebaseMerge$(merge.id)}>以当前版本为据重写</button>
+                <button class="secondary" onClick$={() => dismissMerge$(merge.id)}>放弃</button>
+              </div>
+            </div>
+          ))}
+        </article>
+
+        <article class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h2>待办与重试</h2>
+            <div style="display:flex;gap:8px;align-items:center">
+              <span class="pill">{view.outbox.length} 条</span>
+              {view.outbox.length > 0 && <button class="secondary" onClick$={retryAll$}>全部重试</button>}
+            </div>
+          </div>
+          <p style="color:#638087;font-size:13px;margin-top:4px">写入失败的操作按「厅 + 操作编号」保留在这里，会自动重试，刷新或重开页面后继续。</p>
+          {view.outbox.length === 0 && <p>没有未落账的待办。</p>}
+          {view.outbox.map((entry) => (
+            <div class="todo-row" key={entry.op.opId}>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                <b>{OP_LABELS[entry.op.payload.type]} · {hallName(entry.op.hallId)}</b>
+                <span class="pill warn">已重试 ×{entry.attempts}</span>
+              </div>
+              <div class="mono" style="margin-top:4px">{entry.op.hallId} · {entry.op.opId}</div>
+              {entry.lastError && <div style="color:#a1322c;font-size:13px;margin-top:4px">{entry.lastError}</div>}
+              <div style="display:flex;gap:8px;margin-top:8px">
+                <button class="secondary" onClick$={() => retryOne$(entry.op.hallId, entry.op.opId)}>重试</button>
+                <button class="danger" onClick$={() => discardOne$(entry.op.hallId, entry.op.opId)}>放弃</button>
+              </div>
+            </div>
+          ))}
+        </article>
+      </section>
+
+      <section class="grid" style="margin-top:18px">
+        <article class="panel">
           <h2>术语库</h2>
-          {state.terms.map((term) => <div class="queue-row" key={term.id}><span/><div><b>{term.phrase}</b><div>{term.translation} · {term.language}</div></div><span class="pill">{term.approved ? '已批准' : '待审'}</span><button disabled={term.approved} onClick$={() => approveTerm$(term.id)}>批准</button></div>)}
+          {view.terms.map((term) => (
+            <div class="queue-row" key={term.id}>
+              <span />
+              <div><b>{term.phrase}</b><div>{term.translation} · {term.language}</div></div>
+              <span class="pill">{term.approved ? '已批准' : '待审'}</span>
+              <button disabled={term.approved} onClick$={() => approveTerm$(term.id)}>批准</button>
+            </div>
+          ))}
         </article>
         <article class="panel">
           <h2>操作与交接时间线</h2>
-          {state.audits.filter((audit) => audit.roomId === state.activeRoomId).slice(0, 10).map((audit) => <div style="padding:10px 0;border-bottom:1px solid #e6efee" key={audit.id}><small>{new Date(audit.at).toLocaleTimeString()}</small><div>{audit.message}</div></div>)}
+          {hallEvents().map((event) => (
+            <div style="padding:10px 0;border-bottom:1px solid #e6efee" key={event.id}>
+              <small>{new Date(event.at).toLocaleTimeString()}</small>
+              <div>{event.message}</div>
+            </div>
+          ))}
         </article>
       </section>
     </main>
